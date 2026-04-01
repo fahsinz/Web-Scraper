@@ -60,7 +60,7 @@ def scrape_thisweek_clean():
         print(f"✅ Cleaned: {name} | {address}")
 
     # Save to CSV
-    filename = 'toronto_indie_venues_clean.csv'
+    filename = 'thisweekto_indie_venues.csv'
     with open(filename, 'w', newline='', encoding='utf-8') as f:
         # Notice how Address perfectly replaces Raw_Data here
         writer = csv.DictWriter(f, fieldnames=["Name", "Address", "Phone", "Hours", "Website"])

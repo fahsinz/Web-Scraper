@@ -1,1 +1,4 @@
+# Ignore python environments
 .venv/
+__pycache__/
+*.py[cod]
