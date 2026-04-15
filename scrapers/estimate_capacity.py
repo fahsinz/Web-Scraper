@@ -51,10 +51,10 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
 # ── Defaults ──────────────────────────────────────────────────
-DEFAULT_INPUT = "indieonthemove_venues.csv"
-DEFAULT_OUTPUT = "indieonthemove_with_capacity.csv"
-GEOCODE_CACHE = "geocode_cache.json"
-FOOTPRINT_CACHE = "footprint_cache.json"
+DEFAULT_INPUT = "../data/indieonthemove_venues.csv"
+DEFAULT_OUTPUT = "../data/indieonthemove_with_capacity.csv"
+GEOCODE_CACHE = "../data/geocode_cache.json"
+FOOTPRINT_CACHE = "../data/footprint_cache.json"
 
 # ── Column mapping (actual CSV → internal names) ─────────────
 # This makes the script adaptable: change this dict if column names differ.
