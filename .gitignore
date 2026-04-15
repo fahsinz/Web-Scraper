@@ -1,15 +1,22 @@
-# Ignore python environments
+# Python
 .venv/
 __pycache__/
 *.py[cod]
 
-# Claude Code
-.claude/
+# Secrets & credentials
+.env
+.cache
+**/.cache
 
-# Cache files
+# Scraper caches (expensive API calls — keep locally, not in git)
 cache/
 geocode_cache.json
 footprint_cache.json
+data/geocode_cache.json
+data/footprint_cache.json
 
-# Secrets
-.env
+# Dev/test scripts
+test_spotify.py
+
+# Claude Code
+.claude/
