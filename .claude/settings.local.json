@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(head -3 data/*.csv)",
-      "Bash(wc -l data/*.csv)",
-      "Bash(python *)"
-    ]
-  }
-}

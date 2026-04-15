@@ -3,6 +3,9 @@
 __pycache__/
 *.py[cod]
 
+# Claude Code
+.claude/
+
 # Cache files
 cache/
 geocode_cache.json
