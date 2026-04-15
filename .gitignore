@@ -7,3 +7,6 @@ __pycache__/
 cache/
 geocode_cache.json
 footprint_cache.json
+
+# Secrets
+.env
