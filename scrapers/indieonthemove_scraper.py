@@ -482,21 +482,49 @@ FIELDNAMES = [
 ]
 
 
-def save_to_csv(data, filename):
-    if not data:
+def load_existing_urls(filename):
+    """Load Profile_URLs from an existing CSV to skip already-scraped venues."""
+    urls = set()
+    if os.path.exists(filename):
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    url = row.get("Profile_URL", "").strip()
+                    if url:
+                        urls.add(url)
+            print(f"📂 Loaded {len(urls)} existing venues from {filename}")
+        except Exception as e:
+            print(f"⚠️ Could not read existing CSV: {e}")
+    return urls
+
+
+def save_to_csv(data, filename, existing_data=None):
+    if not data and not existing_data:
         print("⚠️ No data to save.")
         return
+    all_data = (existing_data or []) + data
     with open(filename, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
         writer.writeheader()
-        writer.writerows(data)
-    print(f"\n📁 Saved {len(data)} venues to {filename}")
+        writer.writerows(all_data)
+    print(f"\n📁 Saved {len(all_data)} total venues to {filename} ({len(data)} new)")
 
 
 # ─── MAIN ────────────────────────────────────────────────────
 def main():
     driver = init_driver()
     scraped_data = []
+
+    # Load existing venues so we can skip them and preserve them on save
+    existing_urls = load_existing_urls(OUTPUT_FILE)
+    existing_data = []
+    if os.path.exists(OUTPUT_FILE):
+        try:
+            with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
+                existing_data = list(csv.DictReader(f))
+        except Exception:
+            pass
 
     try:
         # 1. Login
@@ -528,12 +556,22 @@ def main():
                 f.write(driver.page_source)
             return
 
-        urls = urls[:TEST_LIMIT]
-        print(f"\n🎯 Scraping {len(urls)} venues (TEST_LIMIT={TEST_LIMIT})...\n")
+        # Filter out already-scraped venues
+        new_urls = [u for u in urls if u not in existing_urls]
+        skipped = len(urls) - len(new_urls)
+        if skipped:
+            print(f"\n⏭️ Skipping {skipped} already-scraped venues")
+
+        new_urls = new_urls[:TEST_LIMIT]
+        print(f"🎯 Scraping {len(new_urls)} new venues (TEST_LIMIT={TEST_LIMIT})...\n")
+
+        if not new_urls:
+            print("✅ All venues already scraped. Nothing to do.")
+            return
 
         # 4. Scrape each venue profile
-        for i, url in enumerate(urls, 1):
-            print(f"[{i}/{len(urls)}] ", end="")
+        for i, url in enumerate(new_urls, 1):
+            print(f"[{i}/{len(new_urls)}] ", end="")
             if not browser_is_alive(driver):
                 print("❌ Browser died. Saving progress...")
                 break
@@ -548,12 +586,12 @@ def main():
             else:
                 print("   ⚠️ Failed")
 
-        # 5. Save
-        save_to_csv(scraped_data, OUTPUT_FILE)
+        # 5. Save (existing + new)
+        save_to_csv(scraped_data, OUTPUT_FILE, existing_data)
 
     except KeyboardInterrupt:
         print("\n⚠️ Interrupted. Saving progress...")
-        save_to_csv(scraped_data, OUTPUT_FILE)
+        save_to_csv(scraped_data, OUTPUT_FILE, existing_data)
 
     finally:
         print("🧹 Closing browser...")
