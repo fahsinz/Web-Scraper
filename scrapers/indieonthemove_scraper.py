@@ -15,7 +15,7 @@ from selenium.common.exceptions import (
 import undetected_chromedriver as uc
 
 # ─── CONFIG ──────────────────────────────────────────────────
-OUTPUT_FILE = "indieonthemove_venues.csv"
+OUTPUT_FILE = "../data/indieonthemove_venues.csv"
 TEST_LIMIT = 500           # venues per run (raise once confirmed working)
 SLEEP_BETWEEN = 3         # seconds between page loads
 PAGE_LOAD_TIMEOUT = 30
