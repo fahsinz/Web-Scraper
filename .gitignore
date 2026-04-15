@@ -2,3 +2,8 @@
 .venv/
 __pycache__/
 *.py[cod]
+
+# Cache files
+cache/
+geocode_cache.json
+footprint_cache.json
