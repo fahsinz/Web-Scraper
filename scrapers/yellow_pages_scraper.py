@@ -85,7 +85,7 @@ def scrape_yellow_pages_paginated():
         time.sleep(2)
 
     # Save to CSV
-    filename = 'yellow_pages_music_leads.csv'
+    filename = '../data/yellow_pages_music_leads.csv'
     if venues:
         with open(filename, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=["Name", "Address", "Phone", "Cuisine"])
