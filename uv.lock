@@ -457,6 +457,15 @@ wheels = [
 ]
 
 [[package]]
+name = "redis"
+version = "7.4.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/7b/7f/3759b1d0d72b7c92f0d70ffd9dc962b7b7b5ee74e135f9d7d8ab06b8a318/redis-7.4.0.tar.gz", hash = "sha256:64a6ea7bf567ad43c964d2c30d82853f8df927c5c9017766c55a1d1ed95d18ad", size = 4943913, upload-time = "2026-03-24T09:14:37.53Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/74/3a/95deec7db1eb53979973ebd156f3369a72732208d1391cd2e5d127062a32/redis-7.4.0-py3-none-any.whl", hash = "sha256:a9c74a5c893a5ef8455a5adb793a31bb70feb821c86eccb62eebef5a19c429ec", size = 409772, upload-time = "2026-03-24T09:14:35.968Z" },
+]
+
+[[package]]
 name = "requests"
 version = "2.32.5"
 source = { registry = "https://pypi.org/simple" }
@@ -666,6 +675,20 @@ wheels = [
 ]
 
 [[package]]
+name = "spotipy"
+version = "2.26.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "redis" },
+    { name = "requests" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/88/00/2de6f99c9b8e5fd519fd55b11ec94b8e97a51e8a9fdf546edfe6aaf8727b/spotipy-2.26.0.tar.gz", hash = "sha256:df6a25d8209072efa8cea165608ee644884e3804f8762b6d8e06ca1a5c7f8a63", size = 45292, upload-time = "2026-03-03T16:37:39.367Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f5/ff/594b82c19b3291eb3f9454beba7f74f19753035fb9b3e54eebd5ae5013a6/spotipy-2.26.0-py3-none-any.whl", hash = "sha256:2726854ddfa0e5624aada592e737832ec75bdc00ae12c102779f8bd995329d49", size = 31985, upload-time = "2026-03-03T16:37:38.225Z" },
+]
+
+[[package]]
 name = "threadpoolctl"
 version = "3.6.0"
 source = { registry = "https://pypi.org/simple" }
@@ -782,13 +805,16 @@ dependencies = [
     { name = "beautifulsoup4" },
     { name = "geopandas" },
     { name = "geopy" },
+    { name = "numpy" },
     { name = "osmnx" },
     { name = "pyproj" },
+    { name = "python-dotenv" },
     { name = "requests" },
     { name = "scikit-learn" },
     { name = "selenium" },
     { name = "setuptools" },
     { name = "shapely" },
+    { name = "spotipy" },
     { name = "tqdm" },
     { name = "undetected-chromedriver" },
     { name = "webdriver-manager" },
@@ -799,13 +825,16 @@ requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.14.3" },
     { name = "geopandas", specifier = ">=1.1.3" },
     { name = "geopy", specifier = ">=2.4.1" },
+    { name = "numpy", specifier = ">=2.4.4" },
     { name = "osmnx", specifier = ">=2.1.0" },
     { name = "pyproj", specifier = ">=3.7.2" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "requests", specifier = ">=2.32.5" },
     { name = "scikit-learn", specifier = ">=1.8.0" },
     { name = "selenium", specifier = ">=4.41.0" },
     { name = "setuptools", specifier = ">=82.0.1" },
     { name = "shapely", specifier = ">=2.1.2" },
+    { name = "spotipy", specifier = ">=2.24.0" },
     { name = "tqdm", specifier = ">=4.67.3" },
     { name = "undetected-chromedriver", specifier = ">=3.5.5" },
     { name = "webdriver-manager", specifier = ">=4.0.2" },

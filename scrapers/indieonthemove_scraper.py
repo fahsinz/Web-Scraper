@@ -2,6 +2,8 @@ import csv
 import re
 import time
 import os
+import random
+from datetime import datetime
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
@@ -16,14 +18,73 @@ import undetected_chromedriver as uc
 
 # ─── CONFIG ──────────────────────────────────────────────────
 OUTPUT_FILE = "../data/indieonthemove_venues.csv"
-TEST_LIMIT = 500           # venues per run (raise once confirmed working)
-SLEEP_BETWEEN = 3         # seconds between page loads
-PAGE_LOAD_TIMEOUT = 30
-MAX_PAGES = 50             # max result pages to paginate through
+ERROR_LOG_FILE = "../data/scraper_errors.log"
 
-# Search filters — the scraper will interact with the form dropdowns
-TARGET_COUNTRY = "Canada"       # or "United States"
-TARGET_STATE = "Ontario"        # leave "" to get all states in that country
+TARGET_COUNTRY = "Canada"
+
+# Add or remove provinces here. Each one runs a full search-collect-scrape cycle.
+TARGET_PROVINCES = [
+    "Ontario",
+    "Quebec",
+    "British Columbia",
+    "Alberta",
+    "Manitoba",
+    "Nova Scotia",
+    "New Brunswick",
+]
+
+# US expansion (per Awksion brief simplification: 5 cities). Set RUN_US=True to enable.
+RUN_US = True
+US_TARGET_STATES = [
+    "New York",
+    "California",
+    "Illinois",
+    "Tennessee",
+    "Texas",
+]
+# Post-filter venues to these cities per state. Empty list = keep all venues in that state.
+US_TARGET_CITIES = {
+    "New York":   ["New York", "Brooklyn", "Manhattan", "Queens", "Bronx", "Staten Island"],
+    "California": ["Los Angeles", "Hollywood", "West Hollywood", "Santa Monica", "Long Beach", "Pasadena"],
+    "Illinois":   ["Chicago"],
+    "Tennessee":  ["Nashville"],
+    "Texas":      ["Austin"],
+}
+
+TEST_LIMIT = 0                       # 0 = no per-province limit on NEW venues
+MAX_PAGES_PER_PROVINCE = 50
+
+# Driver cycling thresholds — protects against Selenium memory bloat on long runs
+DRIVER_RESTART_EVERY_N_PAGES = 100
+DRIVER_RESTART_EVERY_SECONDS = 3600
+
+# Timeouts
+PAGE_LOAD_TIMEOUT = 30
+WAIT_TIMEOUT = 20
+
+# Cloudflare login is manual, so headless is off by default
+HEADLESS = False
+
+
+# ─── SMALL UTILS ────────────────────────────────────────────
+def rand_sleep(a=1.5, b=3.5):
+    time.sleep(random.uniform(a, b))
+
+
+def normalize_url(url):
+    if not url:
+        return ""
+    u = url.strip().split("?")[0].split("#")[0].rstrip("/")
+    return u.lower()
+
+
+def log_error(province, url, error_type, message):
+    parent = os.path.dirname(ERROR_LOG_FILE) or "."
+    os.makedirs(parent, exist_ok=True)
+    with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
+        ts = datetime.now().isoformat(timespec="seconds")
+        msg = (message or "").replace("\n", " ").replace("\r", " ")[:300]
+        f.write(f"{ts}\t{province}\t{url}\t{error_type}\t{msg}\n")
 
 
 # ─── DRIVER SETUP ───────────────────────────────────────────
@@ -31,10 +92,11 @@ def init_driver():
     print("🕵️‍♂️ Launching stealth browser...")
     options = uc.ChromeOptions()
     options.add_argument("--disable-popup-blocking")
-    options.add_argument("--no-first-run")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-notifications")
     options.add_argument("--start-maximized")
+    if HEADLESS:
+        options.add_argument("--headless=new")
     driver = uc.Chrome(options=options, version_main=146)
     driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
     return driver
@@ -48,7 +110,6 @@ def browser_is_alive(driver):
         return False
 
 
-# ─── MANUAL LOGIN ────────────────────────────────────────────
 def manual_login_pause(driver):
     print("🔐 Navigating to login page...")
     driver.get("https://www.indieonthemove.com/login")
@@ -64,210 +125,280 @@ def manual_login_pause(driver):
     print("✅ Browser alive. Resuming...\n")
 
 
-# ─── INTERACT WITH SEARCH FORM (Vue.js SPA) ─────────────────
-def search_venues_via_form(driver, country=TARGET_COUNTRY, state=TARGET_STATE):
-    """
-    THE KEY FIX: The venue search is a Vue.js SPA. URL parameters
-    are IGNORED. We must interact with the actual form dropdowns:
+# ─── DRIVER STATE (FOR CYCLING) ─────────────────────────────
+class DriverState:
+    """Tracks the live driver, its age, and pages-since-restart for cycling."""
 
-    1. Navigate to /venues
-    2. Select country from the 1st <select> (enables the state dropdown)
-    3. Wait for state dropdown to populate via AJAX
-    4. Select state from the 2nd <select>
-    5. Click the "Search" button
-    6. Wait for table rows to appear
-    """
-    print("📍 Navigating to Venues directory...")
-    driver.get("https://www.indieonthemove.com/venues")
-    time.sleep(5)  # let Vue.js mount and render
+    def __init__(self):
+        self.driver = None
+        self.started_at = 0.0
+        self.pages_since_restart = 0
 
-    # ── Step 1: Find and select COUNTRY ──
-    print(f"   🌍 Selecting country: {country}")
+    def start(self):
+        self.driver = init_driver()
+        self.started_at = time.time()
+        self.pages_since_restart = 0
+        manual_login_pause(self.driver)
+
+    def quit(self):
+        try:
+            if self.driver:
+                self.driver.quit()
+        except Exception:
+            pass
+        self.driver = None
+
+    def restart(self):
+        print("\n♻️ Cycling driver to free memory & reset state...")
+        self.quit()
+        self.start()
+
+    def maybe_cycle(self):
+        elapsed = time.time() - self.started_at
+        if (self.pages_since_restart >= DRIVER_RESTART_EVERY_N_PAGES
+                or elapsed >= DRIVER_RESTART_EVERY_SECONDS):
+            print(
+                f"\n♻️ Cycle threshold reached "
+                f"({self.pages_since_restart} pages / {elapsed:.0f}s)"
+            )
+            self.restart()
+
+    def increment_page(self):
+        self.pages_since_restart += 1
+
+
+# ─── RETRY HELPERS ──────────────────────────────────────────
+def get_with_retries(driver, url, retries=2):
+    """Navigate to url with up to `retries` retries on Timeout / WebDriver errors."""
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            driver.get(url)
+            WebDriverWait(driver, WAIT_TIMEOUT).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            return True
+        except TimeoutException as e:
+            last_err = e
+            print(f"   ⏰ Page-load timeout (attempt {attempt + 1}/{retries + 1})")
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
+            rand_sleep(2, 4)
+        except (StaleElementReferenceException, WebDriverException) as e:
+            last_err = e
+            print(f"   ⚠️ {type(e).__name__} (attempt {attempt + 1}/{retries + 1})")
+            rand_sleep(2, 4)
+    if last_err:
+        raise last_err
+    return False
+
+
+# ─── SEARCH FORM (Vue.js SPA) ───────────────────────────────
+def _find_country_select(driver):
+    selects = driver.find_elements(By.CSS_SELECTOR, "form select.form-control")
+    for sel in selects:
+        if "All Countries" in sel.text:
+            return sel
+    return None
+
+
+def _find_state_select(driver):
+    selects = driver.find_elements(By.CSS_SELECTOR, "form select.form-control")
+    for sel in selects:
+        opts = sel.find_elements(By.TAG_NAME, "option")
+        texts = [o.text for o in opts]
+        if "All States" in texts and len(opts) > 1:
+            return sel
+    return None
+
+
+def search_venues_via_form(driver, country, state):
+    """The venue search is a Vue.js SPA — URL params are ignored, must use the form."""
+    print(f"📍 Loading /venues for {country} → {state}...")
     try:
-        # The form has multiple <select> elements. The country one
-        # has options "All Countries", "United States", "Canada"
-        selects = driver.find_elements(By.CSS_SELECTOR, "form select.form-control")
-        country_select = None
-        for sel in selects:
-            options_text = sel.text
-            if "All Countries" in options_text:
-                country_select = sel
-                break
+        driver.get("https://www.indieonthemove.com/venues")
+    except TimeoutException:
+        try:
+            driver.execute_script("window.stop();")
+        except Exception:
+            pass
 
-        if not country_select:
-            print("   ❌ Could not find country dropdown!")
-            return False
-
-        # Use Selenium's Select helper to pick by visible text
-        select_obj = Select(country_select)
-        select_obj.select_by_visible_text(country)
-        print(f"   ✅ Country set to: {country}")
-
-    except Exception as e:
-        print(f"   ❌ Failed to select country: {e}")
+    try:
+        WebDriverWait(driver, WAIT_TIMEOUT).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "form select.form-control"))
+        )
+    except TimeoutException:
+        print("   ❌ Search form never appeared.")
         return False
 
-    # ── Step 2: Wait for STATE dropdown to enable and populate ──
-    print(f"   🏛️ Waiting for state dropdown to load...")
-    time.sleep(3)  # give Vue.js time to fetch states via API
+    rand_sleep(1, 2)
+
+    # Country
+    try:
+        country_sel = _find_country_select(driver)
+        if not country_sel:
+            print("   ❌ Country dropdown not found.")
+            return False
+        Select(country_sel).select_by_visible_text(country)
+        print(f"   ✅ Country: {country}")
+    except Exception as e:
+        print(f"   ❌ Country select failed: {e}")
+        return False
+
+    # Wait for state dropdown to populate via AJAX
+    try:
+        WebDriverWait(driver, WAIT_TIMEOUT).until(
+            lambda d: _find_state_select(d) is not None
+        )
+    except TimeoutException:
+        print("   ⚠️ State dropdown didn't populate in time.")
+        return False
 
     if state:
         try:
-            # Re-find selects (Vue may have re-rendered the DOM)
-            selects = driver.find_elements(By.CSS_SELECTOR, "form select.form-control")
-            state_select = None
-            for sel in selects:
-                # The state dropdown is the one that WAS disabled
-                # and now should have options beyond "All States"
-                options = sel.find_elements(By.TAG_NAME, "option")
-                option_texts = [o.text for o in options]
-                if "All States" in option_texts and len(options) > 1:
-                    state_select = sel
-                    break
-
-            if not state_select:
-                # Maybe it's still loading — wait more
-                time.sleep(3)
-                selects = driver.find_elements(By.CSS_SELECTOR, "form select.form-control")
-                for sel in selects:
-                    options = sel.find_elements(By.TAG_NAME, "option")
-                    option_texts = [o.text for o in options]
-                    if "All States" in option_texts and len(options) > 1:
-                        state_select = sel
-                        break
-
-            if state_select:
-                select_obj = Select(state_select)
-                select_obj.select_by_visible_text(state)
-                print(f"   ✅ State set to: {state}")
-            else:
-                print(f"   ⚠️ State dropdown didn't populate. Searching all states.")
-
+            state_sel = _find_state_select(driver)
+            Select(state_sel).select_by_visible_text(state)
+            print(f"   ✅ State: {state}")
         except Exception as e:
-            print(f"   ⚠️ Could not select state: {e}")
+            print(f"   ❌ State select failed for '{state}': {e}")
+            return False
 
-    # ── Step 3: Click the SEARCH button ──
-    print("   🔍 Clicking Search...")
+    # Click Search
     try:
-        search_btn = driver.find_element(
-            By.XPATH, "//button[contains(text(),'Search')]"
+        btn = WebDriverWait(driver, WAIT_TIMEOUT).until(
+            EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Search')]"))
         )
-        search_btn.click()
-    except Exception:
-        # Fallback: try any button with "Search"
+        btn.click()
+    except Exception as e:
         try:
-            btns = driver.find_elements(By.TAG_NAME, "button")
-            for btn in btns:
-                if "Search" in btn.text:
-                    btn.click()
+            for b in driver.find_elements(By.TAG_NAME, "button"):
+                if "Search" in b.text:
+                    b.click()
                     break
-        except Exception as e:
+        except Exception:
             print(f"   ❌ Could not click Search: {e}")
             return False
 
-    # ── Step 4: Wait for results to load ──
-    print("   ⏳ Waiting for results...")
-    time.sleep(5)
-
-    # Check if results appeared
+    # Wait for results table OR empty-state text
     try:
-        tbody = driver.find_element(By.CSS_SELECTOR, "tbody.bg-white")
-        rows = tbody.find_elements(By.TAG_NAME, "tr")
-        if rows:
-            print(f"   ✅ Found {len(rows)} venues in results!")
-            return True
-        else:
-            # Check for "No venues found"
-            page_text = driver.find_element(By.TAG_NAME, "body").text
-            if "No venues found" in page_text:
-                print("   ⚠️ Search returned 'No venues found'.")
-                print("   💡 Try a different state or remove the state filter.")
-            return False
-    except Exception:
+        WebDriverWait(driver, WAIT_TIMEOUT).until(
+            lambda d: (
+                len(d.find_elements(By.CSS_SELECTOR, "tbody.bg-white tr")) > 0
+                or "No venues found" in (d.find_element(By.TAG_NAME, "body").text or "")
+            )
+        )
+    except TimeoutException:
+        print("   ⏰ Results never appeared.")
         return False
 
+    rows = driver.find_elements(By.CSS_SELECTOR, "tbody.bg-white tr")
+    if rows:
+        print(f"   ✅ {len(rows)} venues on first results page")
+        return True
+    print("   ⚠️ Search returned 'No venues found'.")
+    return False
 
-# ─── COLLECT VENUE LINKS FROM RESULTS TABLE ──────────────────
+
+# ─── COLLECT LINKS ──────────────────────────────────────────
 def collect_links_from_table(driver):
-    """
-    After search results appear, extract venue profile URLs
-    from the results table. Each row has a link to the venue.
-    """
     links = []
     try:
         tbody = driver.find_element(By.CSS_SELECTOR, "tbody.bg-white")
         rows = tbody.find_elements(By.TAG_NAME, "tr")
         for row in rows:
             try:
-                anchors = row.find_elements(By.TAG_NAME, "a")
-                for a in anchors:
+                for a in row.find_elements(By.TAG_NAME, "a"):
                     href = a.get_attribute("href") or ""
                     if "/venues/" in href and "indieonthemove.com" in href:
                         slug = href.split("/venues/")[-1].split("?")[0].split("#")[0]
-                        if slug and slug not in ["", "search", "view"]:
+                        if slug and slug not in ("", "search", "view"):
                             clean = href.split("/venues/")[0] + "/venues/" + slug
                             links.append(clean)
             except StaleElementReferenceException:
                 continue
     except Exception as e:
         print(f"   ⚠️ Error reading table: {e}")
+    return list(dict.fromkeys(links))
 
-    return list(dict.fromkeys(links))  # deduplicate
+
+def get_active_page_num(driver):
+    try:
+        pagination = driver.find_element(By.CSS_SELECTOR, "nav[aria-label='pagination']")
+        for item in pagination.find_elements(By.CSS_SELECTOR, "li.page-item"):
+            if "active" in (item.get_attribute("class") or ""):
+                return (item.text or "").strip()
+    except Exception:
+        pass
+    return None
 
 
 def click_next_page(driver):
-    """Click the next pagination link. Returns True if successful."""
+    current = get_active_page_num(driver)
     try:
         pagination = driver.find_element(By.CSS_SELECTOR, "nav[aria-label='pagination']")
-        page_items = pagination.find_elements(By.CSS_SELECTOR, "li.page-item")
-
-        # Find the currently active page
-        active_found = False
-        for item in page_items:
-            if active_found:
-                # This is the page AFTER the active one
-                link = item.find_element(By.TAG_NAME, "a")
-                link.click()
-                time.sleep(4)
+        items = pagination.find_elements(By.CSS_SELECTOR, "li.page-item")
+        active_seen = False
+        for item in items:
+            if active_seen:
+                cls = item.get_attribute("class") or ""
+                if "disabled" in cls:
+                    return False
+                try:
+                    item.find_element(By.TAG_NAME, "a").click()
+                except Exception:
+                    return False
+                # Wait for active page number to actually change
+                try:
+                    WebDriverWait(driver, WAIT_TIMEOUT).until(
+                        lambda d: get_active_page_num(d) not in (current, None)
+                    )
+                except TimeoutException:
+                    return False
+                rand_sleep(1.5, 3.0)
                 return True
-            if "active" in item.get_attribute("class"):
-                active_found = True
-
+            if "active" in (item.get_attribute("class") or ""):
+                active_seen = True
         return False
     except Exception:
         return False
 
 
-def get_all_venue_links(driver, max_pages=MAX_PAGES):
-    """Collect venue links across multiple result pages."""
+def get_all_venue_links(driver, max_pages):
+    """Walk pagination collecting venue profile links. Stops on repeated active page."""
     all_links = []
-
+    seen_pages = set()
     for page_num in range(1, max_pages + 1):
-        print(f"\n📄 Collecting links from results page {page_num}...")
-        page_links = collect_links_from_table(driver)
-
-        if not page_links:
-            print(f"   🛑 No links on page {page_num}. Stopping.")
+        active = get_active_page_num(driver)
+        if active and active in seen_pages:
+            print(f"   🛑 Already visited active page {active}. Stopping.")
             break
+        if active:
+            seen_pages.add(active)
 
-        print(f"   Found {len(page_links)} venues")
+        print(f"\n📄 Reading results page {page_num} (active={active})...")
+        page_links = collect_links_from_table(driver)
+        if not page_links:
+            print("   🛑 No links on this page. Stopping pagination.")
+            break
+        print(f"   {len(page_links)} venue links")
         all_links.extend(page_links)
 
-        # Try to go to next page
         if page_num < max_pages:
             if not click_next_page(driver):
                 print("   🛑 No more pages.")
                 break
 
     all_links = list(dict.fromkeys(all_links))
-    print(f"\n🔗 Total unique venue links: {len(all_links)}")
+    print(f"\n🔗 {len(all_links)} unique venue links across {len(seen_pages)} page(s)")
     return all_links
 
 
-# ─── EXTRACT DATA FROM ONE VENUE PROFILE ─────────────────────
-def extract_venue_data(driver, url):
+# ─── EXTRACT VENUE DATA ─────────────────────────────────────
+def extract_venue_data(driver, url, source_province):
     """
-    Extract venue data using selectors mapped from debug HTML:
+    Selectors mapped from debug HTML:
       Name         → h4.card-title
       City/State   → meta og:locality / og:region
       Zip          → meta zipcode
@@ -282,16 +413,17 @@ def extract_venue_data(driver, url):
       Description  → card with "Description" header
       Booking Info → card with "Booking Info" header
     """
-    try:
-        driver.get(url)
-    except TimeoutException:
-        print("⚠️ Timed out. Skipping.")
-        return None
-    except (NoSuchWindowException, WebDriverException):
-        print("❌ Browser died.")
-        return None
+    get_with_retries(driver, url, retries=2)
 
-    time.sleep(3)
+    try:
+        WebDriverWait(driver, WAIT_TIMEOUT).until(
+            EC.any_of(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "h4.card-title")),
+                EC.presence_of_element_located((By.CSS_SELECTOR, "div.card-body")),
+            )
+        )
+    except TimeoutException:
+        pass  # extraction below will return N/A for missing fields
 
     def safe_meta(name):
         try:
@@ -319,7 +451,7 @@ def extract_venue_data(driver, url):
         if og != "N/A":
             name = og.split(" - ")[0].split(",")[0].strip()
 
-    # 2. LOCATION (meta tags — reliable)
+    # 2. LOCATION
     city = safe_meta("og:locality")
     state_prov = safe_meta("og:region")
     zip_code = safe_meta("zipcode")
@@ -333,7 +465,6 @@ def extract_venue_data(driver, url):
     except Exception:
         pass
 
-    # Get card-body text for regex
     body_text = ""
     try:
         body_text = driver.find_element(By.CSS_SELECTOR, "div.card-body").text
@@ -460,7 +591,7 @@ def extract_venue_data(driver, url):
     except Exception:
         pass
 
-    time.sleep(SLEEP_BETWEEN)
+    rand_sleep(1.5, 3.5)
 
     return {
         "Name": name, "City": city, "State/Province": state_prov,
@@ -470,135 +601,228 @@ def extract_venue_data(driver, url):
         "Description": description, "Booking_Info": booking,
         "Facebook": facebook, "Instagram": instagram,
         "Upcoming_Events": events, "Profile_URL": url,
+        "Normalized_Profile_URL": normalize_url(url),
+        "Source_Province_Search": source_province,
+        "Scraped_At": datetime.now().isoformat(timespec="seconds"),
     }
 
 
-# ─── SAVE TO CSV ────────────────────────────────────────────
+# ─── CSV (APPEND-SAFE) ──────────────────────────────────────
 FIELDNAMES = [
     "Name", "City", "State/Province", "Zip_Code", "Address",
     "Phone", "Website", "Categories", "Genres", "Capacity",
     "Age_Restriction", "Rating", "Description", "Booking_Info",
     "Facebook", "Instagram", "Upcoming_Events", "Profile_URL",
+    "Normalized_Profile_URL", "Source_Province_Search", "Scraped_At",
 ]
 
 
-def load_existing_urls(filename):
-    """Load Profile_URLs from an existing CSV to skip already-scraped venues."""
-    urls = set()
-    if os.path.exists(filename):
-        try:
-            with open(filename, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    url = row.get("Profile_URL", "").strip()
-                    if url:
-                        urls.add(url)
-            print(f"📂 Loaded {len(urls)} existing venues from {filename}")
-        except Exception as e:
-            print(f"⚠️ Could not read existing CSV: {e}")
-    return urls
+def ensure_csv_ready(filename):
+    """Create CSV with header if missing/empty; migrate header if older schema."""
+    parent = os.path.dirname(filename) or "."
+    os.makedirs(parent, exist_ok=True)
 
-
-def save_to_csv(data, filename, existing_data=None):
-    if not data and not existing_data:
-        print("⚠️ No data to save.")
+    if not os.path.exists(filename) or os.path.getsize(filename) == 0:
+        with open(filename, "w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=FIELDNAMES).writeheader()
+        print(f"📄 Created fresh CSV: {filename}")
         return
-    all_data = (existing_data or []) + data
+
+    with open(filename, "r", encoding="utf-8") as f:
+        try:
+            existing = next(csv.reader(f))
+        except StopIteration:
+            existing = []
+
+    if set(existing) >= set(FIELDNAMES):
+        return  # already has all our columns (extra columns OK to ignore on append)
+
+    print(f"🔄 Migrating CSV header: adding {sorted(set(FIELDNAMES) - set(existing))}")
+    with open(filename, "r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
     with open(filename, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(all_data)
-    print(f"\n📁 Saved {len(all_data)} total venues to {filename} ({len(data)} new)")
+        for r in rows:
+            if not r.get("Normalized_Profile_URL"):
+                r["Normalized_Profile_URL"] = normalize_url(r.get("Profile_URL", ""))
+            writer.writerow(r)
+    print("   ✅ Migration complete")
+
+
+def load_seen_urls(filename):
+    """Load normalized URLs from existing CSV into a set for fast dedup."""
+    seen = set()
+    if not os.path.exists(filename):
+        return seen
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                norm = (row.get("Normalized_Profile_URL") or "").strip()
+                if not norm:
+                    norm = normalize_url(row.get("Profile_URL", ""))
+                if norm:
+                    seen.add(norm)
+    except Exception as e:
+        print(f"⚠️ Error reading existing CSV: {e}")
+    print(f"📂 Loaded {len(seen)} already-scraped URLs from {filename}")
+    return seen
+
+
+def append_row_to_csv(row, filename):
+    """Append a single row to the CSV and flush so a crash doesn't lose it."""
+    with open(filename, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
+        writer.writerow(row)
+        f.flush()
+
+
+# ─── PER-REGION SCRAPE LOOP (extracted so we can reuse for CA + US) ──
+def _scrape_one_region(state, country, region, city_filter, seen_urls):
+    """Scrape one (country, region) pair. city_filter: list of city names to keep,
+    or empty/None to keep everything. Returns (appended, skipped, errors)."""
+    appended = 0
+    skipped = 0
+    errors = 0
+
+    try:
+        ok = search_venues_via_form(state.driver, country, region)
+    except Exception as e:
+        log_error(region, "", type(e).__name__, str(e))
+        ok = False
+
+    if not ok:
+        print(f"   ⚠️ No results for {region}, skipping.")
+        log_error(region, "", "SearchFailed", "search_venues_via_form returned False")
+        rand_sleep(2, 4)
+        return appended, skipped, errors
+
+    try:
+        urls = get_all_venue_links(state.driver, MAX_PAGES_PER_PROVINCE)
+    except Exception as e:
+        log_error(region, "", type(e).__name__, str(e))
+        urls = []
+
+    new_urls = []
+    for u in urls:
+        norm = normalize_url(u)
+        if norm in seen_urls:
+            skipped += 1
+        else:
+            new_urls.append(u)
+
+    print(f"⏭️ {skipped} duplicates skipped | 🆕 {len(new_urls)} new")
+
+    if TEST_LIMIT > 0:
+        new_urls = new_urls[:TEST_LIMIT]
+        print(f"   🎯 Capped to TEST_LIMIT={TEST_LIMIT}")
+
+    cf_lower = [c.lower() for c in (city_filter or [])]
+
+    for i, url in enumerate(new_urls, 1):
+        norm = normalize_url(url)
+        if norm in seen_urls:
+            continue
+
+        state.maybe_cycle()
+        if not browser_is_alive(state.driver):
+            print("❌ Browser died unexpectedly. Restarting...")
+            state.restart()
+
+        print(f"[{region} {i}/{len(new_urls)}] ", end="", flush=True)
+        try:
+            data = extract_venue_data(state.driver, url, region)
+            state.increment_page()
+        except (TimeoutException, WebDriverException, StaleElementReferenceException) as e:
+            log_error(region, url, type(e).__name__, str(e))
+            errors += 1
+            print(f"❌ {type(e).__name__}: {str(e)[:80]}")
+            continue
+        except Exception as e:
+            log_error(region, url, type(e).__name__, str(e))
+            errors += 1
+            print(f"❌ {type(e).__name__}: {str(e)[:80]}")
+            continue
+
+        if not data:
+            log_error(region, url, "NoData", "extract_venue_data returned None")
+            errors += 1
+            print("⚠️  No data extracted")
+            continue
+
+        # Apply city filter (US scope-narrowing per Awksion brief)
+        if cf_lower:
+            city_l = (data.get("City") or "").strip().lower()
+            if not any(target in city_l or city_l in target for target in cf_lower):
+                seen_urls.add(norm)  # don't re-fetch even if we skip
+                print(f"⏭️  filtered out (city='{data.get('City')}' not in target list)")
+                continue
+
+        append_row_to_csv(data, OUTPUT_FILE)
+        seen_urls.add(norm)
+        appended += 1
+        print(
+            f"✅ {data['Name']} | {data['City']}, {data['State/Province']} | "
+            f"Cap: {data['Capacity']} | Ph: {data['Phone']}"
+        )
+
+    return appended, skipped, errors
 
 
 # ─── MAIN ────────────────────────────────────────────────────
 def main():
-    driver = init_driver()
-    scraped_data = []
+    ensure_csv_ready(OUTPUT_FILE)
+    seen_urls = load_seen_urls(OUTPUT_FILE)
 
-    # Load existing venues so we can skip them and preserve them on save
-    existing_urls = load_existing_urls(OUTPUT_FILE)
-    existing_data = []
-    if os.path.exists(OUTPUT_FILE):
-        try:
-            with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
-                existing_data = list(csv.DictReader(f))
-        except Exception:
-            pass
+    print(f"🌐 Canada — provinces ({len(TARGET_PROVINCES)}): {', '.join(TARGET_PROVINCES)}")
+    if RUN_US:
+        print(f"🌐 USA — states ({len(US_TARGET_STATES)}): {', '.join(US_TARGET_STATES)}")
+        for st, cities in US_TARGET_CITIES.items():
+            print(f"     {st}: filter to {cities}")
+    print(
+        f"♻️ Driver cycles every {DRIVER_RESTART_EVERY_N_PAGES} pages "
+        f"or {DRIVER_RESTART_EVERY_SECONDS}s\n"
+    )
+
+    state = DriverState()
+    state.start()
+
+    total_appended = 0
+    total_skipped = 0
+    total_errors = 0
+
+    # Build the (country, region, city_filter) work list
+    work = [("Canada", p, []) for p in TARGET_PROVINCES]
+    if RUN_US:
+        work += [("United States", st, US_TARGET_CITIES.get(st, [])) for st in US_TARGET_STATES]
 
     try:
-        # 1. Login
-        manual_login_pause(driver)
-
-        # 2. Use the search form to find venues
-        search_ok = search_venues_via_form(
-            driver, country=TARGET_COUNTRY, state=TARGET_STATE
-        )
-
-        if not search_ok:
-            # Save page for debugging
-            with open("debug_listing_page.html", "w", encoding="utf-8") as f:
-                f.write(driver.page_source)
-            print("\n⚠️ Search returned no results.")
-            print("   Saved debug_listing_page.html for inspection.")
-            print("\n💡 TROUBLESHOOTING:")
-            print("   - Try setting TARGET_STATE = '' to search all states")
-            print("   - Try TARGET_COUNTRY = 'United States' instead")
-            print("   - The state name must exactly match the dropdown text")
-            return
-
-        # 3. Collect venue links from result pages
-        urls = get_all_venue_links(driver, max_pages=MAX_PAGES)
-
-        if not urls:
-            print("⚠️ No venue links found in results table.")
-            with open("debug_listing_page.html", "w", encoding="utf-8") as f:
-                f.write(driver.page_source)
-            return
-
-        # Filter out already-scraped venues
-        new_urls = [u for u in urls if u not in existing_urls]
-        skipped = len(urls) - len(new_urls)
-        if skipped:
-            print(f"\n⏭️ Skipping {skipped} already-scraped venues")
-
-        new_urls = new_urls[:TEST_LIMIT]
-        print(f"🎯 Scraping {len(new_urls)} new venues (TEST_LIMIT={TEST_LIMIT})...\n")
-
-        if not new_urls:
-            print("✅ All venues already scraped. Nothing to do.")
-            return
-
-        # 4. Scrape each venue profile
-        for i, url in enumerate(new_urls, 1):
-            print(f"[{i}/{len(new_urls)}] ", end="")
-            if not browser_is_alive(driver):
-                print("❌ Browser died. Saving progress...")
-                break
-            data = extract_venue_data(driver, url)
-            if data:
-                scraped_data.append(data)
-                print(
-                    f"   ✅ {data['Name']} | "
-                    f"{data['City']}, {data['State/Province']} | "
-                    f"Cap: {data['Capacity']} | Ph: {data['Phone']}"
-                )
-            else:
-                print("   ⚠️ Failed")
-
-        # 5. Save (existing + new)
-        save_to_csv(scraped_data, OUTPUT_FILE, existing_data)
+        for country, region, city_filter in work:
+            print(f"\n{'='*60}\n🏛️  {country} → {region}\n{'='*60}")
+            appended, skipped, errors = _scrape_one_region(
+                state, country, region, city_filter, seen_urls
+            )
+            total_appended += appended
+            total_skipped += skipped
+            total_errors += errors
+            print(
+                f"\n📊 {region}: 🆕 {appended} appended | "
+                f"⏭️ {skipped} skipped | ❌ {errors} errors"
+            )
+            rand_sleep(3, 6)
 
     except KeyboardInterrupt:
-        print("\n⚠️ Interrupted. Saving progress...")
-        save_to_csv(scraped_data, OUTPUT_FILE, existing_data)
+        print("\n⚠️ Interrupted by user. Progress is already saved (append-mode).")
 
     finally:
-        print("🧹 Closing browser...")
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        print(
+            f"\n📈 RUN SUMMARY: 🆕 {total_appended} appended | "
+            f"⏭️ {total_skipped} skipped | ❌ {total_errors} errors"
+        )
+        print(f"🗂️ CSV:    {OUTPUT_FILE}")
+        print(f"🪵 Errors: {ERROR_LOG_FILE}")
+        state.quit()
         os._exit(0)
 
 

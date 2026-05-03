@@ -40,7 +40,7 @@ from shapely.ops import transform
 import pyproj
 
 # ML
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.model_selection import cross_val_predict, cross_val_score
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
@@ -57,7 +57,6 @@ GEOCODE_CACHE = "../data/geocode_cache.json"
 FOOTPRINT_CACHE = "../data/footprint_cache.json"
 
 # ── Column mapping (actual CSV → internal names) ─────────────
-# This makes the script adaptable: change this dict if column names differ.
 COL_MAP = {
     "name": "Name",
     "address": "Address",
@@ -65,19 +64,28 @@ COL_MAP = {
     "province": "State/Province",
     "zip": "Zip_Code",
     "categories": "Categories",
+    "genres": "Genres",
     "description": "Description",
     "capacity": "Capacity",
+    "phone": "Phone",
+    "website": "Website",
+    "booking": "Booking_Info",
+    "events": "Upcoming_Events",
+    "age": "Age_Restriction",
+    "source_province": "Source_Province_Search",
 }
 
 # ── Venue type classification ────────────────────────────────
 TYPE_KEYWORDS = {
-    "bar":        ["bar", "pub", "tavern", "taproom", "lounge", "saloon"],
+    "bar":        ["bar", "pub", "tavern", "taproom", "lounge", "saloon", "alehouse"],
     "club":       ["club", "nightclub", "night club", "dance"],
-    "restaurant": ["restaurant", "cafe", "bistro", "diner", "grill", "eatery", "kitchen"],
-    "theatre":    ["theatre", "theater", "concert hall", "opera", "arena", "amphitheatre", "auditorium"],
-    "festival":   ["festival"],
-    "gallery":    ["gallery", "art gallery"],
-    "venue":      ["music venue", "venue", "rental"],
+    "restaurant": ["restaurant", "cafe", "café", "bistro", "diner", "grill",
+                   "eatery", "kitchen", "coffee", "pizzeria"],
+    "theatre":    ["theatre", "theater", "concert hall", "opera", "arena",
+                   "amphitheatre", "auditorium", "playhouse"],
+    "festival":   ["festival", "fest"],
+    "gallery":    ["gallery", "art gallery", "arts centre", "arts center"],
+    "venue":      ["music venue", "venue", "rental", "ballroom", "hall"],
 }
 
 # Code factors (sq ft per person)
@@ -100,6 +108,41 @@ FRONT_OF_HOUSE = 0.60
 MT_PENALTY_DIVISOR = 4
 UNIT_KEYWORDS = re.compile(r"\b(unit|suite|floor|level|ste|apt)\b|#\d", re.I)
 
+# ── Province normalization (handles 2-letter codes + full names) ─
+PROVINCE_NORMALIZATION = {
+    "ON": "Ontario", "QC": "Quebec", "BC": "British Columbia",
+    "AB": "Alberta", "MB": "Manitoba", "NS": "Nova Scotia",
+    "NB": "New Brunswick", "SK": "Saskatchewan",
+    "NL": "Newfoundland and Labrador", "NF": "Newfoundland and Labrador",
+    "PE": "Prince Edward Island", "PEI": "Prince Edward Island",
+    "YT": "Yukon", "NT": "Northwest Territories", "NU": "Nunavut",
+}
+
+# ── City tiers (major metro / mid-size / small-rural) ────────
+# 1 = major metro (CMA > 500k), 2 = mid-size (~100-500k), 3 = small/rural
+_CITY_TIER_1 = {
+    "toronto", "montreal", "montréal", "vancouver", "calgary", "edmonton",
+    "ottawa", "winnipeg", "quebec city", "québec", "quebec",
+    "hamilton", "kitchener", "london", "halifax", "victoria", "windsor",
+    "saskatoon", "regina", "st. catharines", "st catharines",
+    "mississauga", "brampton", "surrey", "laval", "markham", "vaughan",
+    "gatineau", "longueuil", "burnaby", "richmond", "oakville", "burlington",
+    "barrie", "oshawa", "sherbrooke", "kelowna", "abbotsford",
+}
+_CITY_TIER_2 = {
+    "kingston", "trois-rivieres", "trois-rivières", "guelph", "cambridge",
+    "whitby", "ajax", "milton", "moncton", "saint john", "fredericton",
+    "thunder bay", "sudbury", "kanata", "nanaimo", "lethbridge",
+    "peterborough", "st. john's", "st johns", "saint john's",
+    "red deer", "medicine hat", "kamloops", "chilliwack", "drummondville",
+    "saint-jérôme", "saint-jerome", "saguenay", "lévis", "levis",
+    "saanich", "richmond hill", "north vancouver", "west vancouver",
+    "new westminster", "coquitlam", "delta", "saanich", "saint-hyacinthe",
+    "shawinigan", "rimouski", "granby", "victoriaville", "salaberry-de-valleyfield",
+    "brandon", "prince albert", "moose jaw", "charlottetown", "sydney",
+    "cape breton", "truro", "new glasgow", "yellowknife", "whitehorse",
+}
+
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║  STEP 0 — Helpers                                          ║
@@ -108,15 +151,13 @@ UNIT_KEYWORDS = re.compile(r"\b(unit|suite|floor|level|ste|apt)\b|#\d", re.I)
 def classify_venue(categories: str, description: str = "") -> str:
     """Return a venue type string from Categories + Description text."""
     text = f"{categories} {description}".lower()
-    # Priority order matters: club > bar > restaurant > theatre > ...
     for vtype in ["club", "bar", "restaurant", "theatre", "festival", "gallery", "venue"]:
         if any(kw in text for kw in TYPE_KEYWORDS[vtype]):
             return vtype
-    return "venue"  # default
+    return "venue"
 
 
 def parse_capacity(val) -> int | None:
-    """Parse a capacity value; return None if missing/invalid."""
     if pd.isna(val):
         return None
     s = str(val).strip().replace(",", "")
@@ -145,15 +186,86 @@ def save_json_cache(data: dict, path: str):
         json.dump(data, f, indent=2)
 
 
+def normalize_province(p) -> str:
+    """Map '2-letter codes' and full names to a single canonical name."""
+    if not p or (isinstance(p, float) and math.isnan(p)):
+        return ""
+    s = str(p).strip()
+    if not s or s == "N/A":
+        return ""
+    return PROVINCE_NORMALIZATION.get(s.upper(), s)
+
+
+def city_tier(city) -> int:
+    """1 = major metro, 2 = mid-size, 3 = small/rural."""
+    if not city or (isinstance(city, float) and math.isnan(city)):
+        return 3
+    key = str(city).strip().lower()
+    if key in _CITY_TIER_1:
+        return 1
+    if key in _CITY_TIER_2:
+        return 2
+    return 3
+
+
+def count_items(text, sep: str = ",") -> int:
+    if not text or (isinstance(text, float) and math.isnan(text)):
+        return 0
+    s = str(text).strip()
+    if not s or s == "N/A":
+        return 0
+    return sum(1 for x in s.split(sep) if x.strip())
+
+
+def text_len(text) -> int:
+    if not text or (isinstance(text, float) and math.isnan(text)):
+        return 0
+    s = str(text).strip()
+    if not s or s == "N/A":
+        return 0
+    return len(s)
+
+
+# Patterns that suggest a number is a venue capacity, not a year/address.
+_CAPACITY_PATTERNS = [
+    re.compile(r"capacity\s*(?:of|is|:|=)?\s*(\d{2,5})", re.I),
+    re.compile(r"(\d{2,5})[-\s]*(?:person|people|seat|cap)\s*(?:capacity|venue|hall|theatre)?", re.I),
+    re.compile(r"holds?\s*(?:up\s*to\s*)?(\d{2,5})\s*(?:people|persons|guests|patrons)", re.I),
+    re.compile(r"seats?\s*(?:up\s*to\s*)?(\d{2,5})", re.I),
+    re.compile(r"(\d{2,5})[-\s]*seat\s*(?:venue|theatre|theater|hall|auditorium|room)", re.I),
+    re.compile(r"room\s*for\s*(\d{2,5})", re.I),
+    re.compile(r"accommodat(?:e|es|ing)\s*(?:up\s*to\s*)?(\d{2,5})", re.I),
+    re.compile(r"audience\s*of\s*(?:up\s*to\s*)?(\d{2,5})", re.I),
+]
+
+
+def extract_capacity_from_text(text) -> int | None:
+    """Return the largest plausible capacity number found in description text."""
+    if not text or (isinstance(text, float) and math.isnan(text)):
+        return None
+    s = str(text)
+    if not s or s == "N/A":
+        return None
+    candidates = []
+    for pat in _CAPACITY_PATTERNS:
+        for m in pat.finditer(s):
+            try:
+                n = int(m.group(1))
+                if 20 <= n <= 30000:
+                    candidates.append(n)
+            except (ValueError, IndexError):
+                pass
+    return max(candidates) if candidates else None
+
+
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  STEP 1 — Load & Split                                     ║
+# ║  STEP 1 — Load, Parse, Engineer Features                  ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 def load_and_split(input_path: str):
     log.info(f"Loading {input_path}...")
     df = pd.read_csv(input_path, encoding="utf-8")
 
-    # Rename columns if needed via COL_MAP (validates they exist)
     for internal, actual in COL_MAP.items():
         if actual not in df.columns:
             log.warning(f"Column '{actual}' not found — will be treated as empty.")
@@ -175,15 +287,43 @@ def load_and_split(input_path: str):
     return df
 
 
+def add_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Derive extra ML features from existing CSV columns."""
+    df["n_genres"] = df[COL_MAP["genres"]].apply(count_items)
+    df["n_categories"] = df[COL_MAP["categories"]].apply(count_items)
+
+    desc = df[COL_MAP["description"]]
+    df["description_length"] = desc.apply(text_len)
+    df["log_desc_len"] = np.log1p(df["description_length"])
+
+    df["has_website"] = (df[COL_MAP["website"]].astype(str).str.strip() != "N/A").astype(int)
+    df["has_phone"] = (df[COL_MAP["phone"]].astype(str).str.strip() != "N/A").astype(int)
+
+    booking = df[COL_MAP["booking"]].astype(str).str.lower()
+    df["requires_premium"] = booking.str.contains("premium").astype(int)
+
+    df["n_events"] = df[COL_MAP["events"]].apply(lambda x: count_items(x, sep=";"))
+
+    age = df[COL_MAP["age"]].astype(str)
+    df["is_age_restricted"] = age.str.match(r"^\s*\d+\+", na=False).astype(int)
+
+    df["desc_capacity_hint"] = desc.apply(extract_capacity_from_text)
+
+    df["city_tier"] = df[COL_MAP["city"]].apply(city_tier)
+
+    src_norm = df[COL_MAP["source_province"]].apply(normalize_province)
+    fallback_norm = df[COL_MAP["province"]].apply(normalize_province)
+    df["province_norm"] = src_norm.where(src_norm != "", fallback_norm)
+
+    return df
+
+
 # ╔══════════════════════════════════════════════════════════════╗
 # ║  STEP 2 — Geocode                                          ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 def build_address_string(row) -> str:
-    parts = [
-        str(row.get(COL_MAP["address"], "")).strip(),
-    ]
-    # If address already contains city, skip appending
+    parts = [str(row.get(COL_MAP["address"], "")).strip()]
     addr = parts[0]
     city = str(row.get(COL_MAP["city"], "")).strip()
     prov = str(row.get(COL_MAP["province"], "")).strip()
@@ -198,46 +338,27 @@ def build_address_string(row) -> str:
 def geocode_venues(df: pd.DataFrame) -> pd.DataFrame:
     log.info("Geocoding venues...")
     cache = load_json_cache(GEOCODE_CACHE)
-    geolocator = Nominatim(user_agent="awksion_capacity_estimator/1.0", timeout=10)
 
     lats, lons = [], []
-    new_cache_entries = 0
+    cache_hits = 0
+    cache_misses = 0
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Geocoding"):
         addr_str = build_address_string(row)
-        name = str(row.get(COL_MAP["name"], ""))
 
         if addr_str in cache:
             lats.append(cache[addr_str].get("lat"))
             lons.append(cache[addr_str].get("lon"))
-            continue
+            cache_hits += 1
+        else:
+            lats.append(None)
+            lons.append(None)
+            cache_misses += 1
 
-        lat, lon = None, None
-        for attempt in range(3):
-            try:
-                time.sleep(1.1)
-                loc = geolocator.geocode(addr_str)
-                if loc:
-                    lat, lon = loc.latitude, loc.longitude
-                break
-            except (GeocoderTimedOut, GeocoderServiceError) as e:
-                log.debug(f"  Retry {attempt+1} for {name}: {e}")
-                time.sleep(2)
-
-        cache[addr_str] = {"lat": lat, "lon": lon}
-        new_cache_entries += 1
-        lats.append(lat)
-        lons.append(lon)
-
-        # Periodic cache save
-        if new_cache_entries % 20 == 0:
-            save_json_cache(cache, GEOCODE_CACHE)
-
-    save_json_cache(cache, GEOCODE_CACHE)
     df["lat"] = lats
     df["lon"] = lons
     geocoded = df["lat"].notna().sum()
-    log.info(f"  Geocoded: {geocoded}/{len(df)}")
+    log.info(f"  Geocoded: {geocoded}/{len(df)} (cache hits: {cache_hits}, misses: {cache_misses})")
     return df
 
 
@@ -246,19 +367,16 @@ def geocode_venues(df: pd.DataFrame) -> pd.DataFrame:
 # ╚══════════════════════════════════════════════════════════════╝
 
 def get_utm_crs(lat, lon):
-    """Return the EPSG code for the appropriate UTM zone."""
     zone = int((lon + 180) / 6) + 1
     epsg = 32600 + zone if lat >= 0 else 32700 + zone
     return f"EPSG:{epsg}"
 
 
 def score_osm_match(tags: dict, venue_type: str) -> int:
-    """Score how well an OSM building's tags match the venue type."""
     amenity = str(tags.get("amenity", "")).lower()
     building = str(tags.get("building", "")).lower()
     leisure = str(tags.get("leisure", "")).lower()
     all_tags = f"{amenity} {building} {leisure}"
-
     match_map = {
         "bar":        ["bar", "pub"],
         "club":       ["nightclub", "club"],
@@ -271,13 +389,13 @@ def score_osm_match(tags: dict, venue_type: str) -> int:
 
 
 def retrieve_footprint(lat, lon, venue_type, address_str):
-    """Get building footprint area in sq ft with multi-tenant detection."""
     if pd.isna(lat) or pd.isna(lon):
         return None, False, None
 
     point = Point(lon, lat)
     utm_crs = get_utm_crs(lat, lon)
 
+    polys = gpd.GeoDataFrame()
     for radius in [50, 100, 200]:
         try:
             gdf = ox.features.features_from_point((lat, lon), tags={"building": True}, dist=radius)
@@ -287,43 +405,31 @@ def retrieve_footprint(lat, lon, venue_type, address_str):
         except Exception:
             polys = gpd.GeoDataFrame()
             continue
-    else:
-        return None, False, None
 
     if polys.empty:
         return None, False, None
 
-    # Project to UTM for accurate distance/area
     polys_utm = polys.to_crs(utm_crs)
     point_utm = gpd.GeoSeries([point], crs="EPSG:4326").to_crs(utm_crs).iloc[0]
     buffer = point_utm.buffer(15)
-
-    # Find intersecting polygons
     intersecting = polys_utm[polys_utm.geometry.intersects(buffer)]
 
     if len(intersecting) > 1:
-        # Prefer best OSM tag match
-        scores = intersecting.apply(
-            lambda r: score_osm_match(r.to_dict(), venue_type), axis=1
-        )
-        best_score = scores.max()
-        if best_score > 0:
+        scores = intersecting.apply(lambda r: score_osm_match(r.to_dict(), venue_type), axis=1)
+        if scores.max() > 0:
             selected = intersecting.loc[scores.idxmax()]
         else:
-            # Nearest centroid
             dists = intersecting.geometry.centroid.distance(point_utm)
             selected = intersecting.loc[dists.idxmin()]
     elif len(intersecting) == 1:
         selected = intersecting.iloc[0]
     else:
-        # No intersection — fall back to nearest centroid
         dists = polys_utm.geometry.centroid.distance(point_utm)
         selected = polys_utm.loc[dists.idxmin()]
 
     area_m2 = selected.geometry.area
     area_sqft = area_m2 * 10.7639
 
-    # Try to get building levels
     levels = None
     tags = selected.to_dict() if hasattr(selected, "to_dict") else {}
     for key in ["building:levels", "building_levels"]:
@@ -333,7 +439,6 @@ def retrieve_footprint(lat, lon, venue_type, address_str):
             except (ValueError, TypeError):
                 pass
 
-    # Multi-tenant detection
     threshold = MT_THRESHOLDS.get(venue_type, 12_000)
     size_flag = area_sqft > threshold
     addr_flag = bool(UNIT_KEYWORDS.search(str(address_str)))
@@ -397,7 +502,8 @@ def retrieve_all_footprints(df: pd.DataFrame) -> pd.DataFrame:
             adj_areas.append(None)
             mt_flags.append(False)
             levels_list.append(None)
-            cache[cache_key] = {"raw_area_sqft": None, "adj_area_sqft": None, "mt_flag": False, "levels": None}
+            cache[cache_key] = {"raw_area_sqft": None, "adj_area_sqft": None,
+                                "mt_flag": False, "levels": None}
 
         new_entries += 1
         if new_entries % 10 == 0:
@@ -439,159 +545,216 @@ def add_heuristic(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  STEP 5 — Train Model                                      ║
+# ║  STEP 5 — Train Model (with quantile intervals)            ║
 # ╚══════════════════════════════════════════════════════════════╝
 
+NUM_FEATURES = [
+    "log_area",
+    "heuristic_capacity",
+    "n_genres",
+    "n_categories",
+    "log_desc_len",
+    "has_website",
+    "has_phone",
+    "requires_premium",
+    "n_events",
+    "is_age_restricted",
+    "city_tier",
+    "desc_capacity_hint",
+]
+
+CAT_FEATURES = ["venue_type", "province_norm"]
+
+
+def _build_pipeline(loss="squared_error", quantile=None):
+    pre = ColumnTransformer([
+        ("num", "passthrough", NUM_FEATURES),
+        ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), CAT_FEATURES),
+    ])
+    kwargs = dict(
+        loss=loss,
+        max_iter=250,
+        max_depth=4,
+        learning_rate=0.07,
+        min_samples_leaf=3,
+        l2_regularization=0.5,
+        random_state=42,
+    )
+    if quantile is not None:
+        kwargs["quantile"] = quantile
+    return Pipeline([("pre", pre), ("hgb", HistGradientBoostingRegressor(**kwargs))])
+
+
+def _filter_outliers(train_df: pd.DataFrame) -> pd.DataFrame:
+    """Drop obvious bad rows from training: very small / huge / IQR outliers in log-space."""
+    cap = train_df["capacity_parsed"]
+    mask = (cap >= 20) & (cap <= 30000)
+    train_df = train_df[mask]
+    if len(train_df) > 25:
+        log_cap = np.log1p(train_df["capacity_parsed"])
+        q1, q3 = log_cap.quantile([0.05, 0.95])
+        iqr = q3 - q1
+        train_df = train_df[(log_cap >= q1 - 1.5 * iqr) & (log_cap <= q3 + 1.5 * iqr)]
+    return train_df
+
+
 def train_model(df: pd.DataFrame):
-    """Train on venues with BOTH known capacity AND building area."""
+    """Train P50 + P10/P90 quantile models for capacity prediction."""
     mask = df["capacity_parsed"].notna() & df["Building_Area_SqFt"].notna()
     train_df = df[mask].copy()
+    train_df = _filter_outliers(train_df)
 
     if len(train_df) < 5:
         log.warning(f"  Only {len(train_df)} training samples — model may be unreliable.")
         if len(train_df) < 2:
             log.error("  Not enough data to train. Falling back to heuristics only.")
-            return None, None
+            return None, None, None, None
 
-    # Features
     train_df["log_area"] = np.log1p(train_df["Building_Area_SqFt"])
-    train_df["has_unit"] = train_df[COL_MAP["address"]].apply(
-        lambda x: 1 if UNIT_KEYWORDS.search(str(x)) else 0
-    )
-    train_df["mt_binary"] = train_df["Multi_Tenant_Flag"].astype(int)
 
-    feature_cols = ["log_area", "heuristic_capacity", "mt_binary", "has_unit"]
-    cat_cols = ["venue_type", COL_MAP["province"]]
-
-    # Fill NaN heuristic with 0 for model
-    train_df["heuristic_capacity"] = train_df["heuristic_capacity"].fillna(0)
-
+    X = train_df[NUM_FEATURES + CAT_FEATURES]
     y = np.log1p(train_df["capacity_parsed"].values)
 
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", "passthrough", feature_cols),
-            ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), cat_cols),
-        ]
-    )
+    main_pipeline = _build_pipeline(loss="squared_error")
 
-    pipeline = Pipeline([
-        ("pre", preprocessor),
-        ("gbr", GradientBoostingRegressor(
-            n_estimators=100, max_depth=3, learning_rate=0.1,
-            random_state=42, min_samples_leaf=2,
-        )),
-    ])
-
-    X = train_df[feature_cols + cat_cols]
-
-    # Cross-validate
-    n_folds = min(5, len(train_df))
-    if n_folds < 2:
-        n_folds = 2
-
-    cv_preds_log = cross_val_predict(pipeline, X, y, cv=n_folds)
-    cv_preds = np.expm1(cv_preds_log)
-    actuals = train_df["capacity_parsed"].values
-
-    rmse = np.sqrt(np.mean((cv_preds - actuals) ** 2))
-    r2_scores = cross_val_score(pipeline, X, y, cv=n_folds, scoring="r2")
-    r2 = r2_scores.mean()
-    mape = np.mean(np.abs((actuals - cv_preds) / np.clip(actuals, 1, None))) * 100
+    n_folds = min(5, max(2, len(train_df) // 4))
+    try:
+        cv_preds_log = cross_val_predict(main_pipeline, X, y, cv=n_folds)
+        cv_preds = np.expm1(cv_preds_log)
+        actuals = train_df["capacity_parsed"].values
+        rmse = float(np.sqrt(np.mean((cv_preds - actuals) ** 2)))
+        r2_scores = cross_val_score(main_pipeline, X, y, cv=n_folds, scoring="r2")
+        r2 = float(r2_scores.mean())
+        mape = float(np.mean(np.abs((actuals - cv_preds) / np.clip(actuals, 1, None))) * 100)
+    except Exception as e:
+        log.warning(f"  CV failed ({e}); skipping cross-validation metrics.")
+        rmse = r2 = mape = float("nan")
 
     log.info(f"  Model CV (n={len(train_df)}, {n_folds}-fold):")
     log.info(f"    R²:   {r2:.3f}")
     log.info(f"    RMSE: {rmse:.0f}")
     log.info(f"    MAPE: {mape:.1f}%")
 
-    # Fit final model on all training data
-    pipeline.fit(X, y)
+    main_pipeline.fit(X, y)
+
+    low_pipeline = _build_pipeline(loss="quantile", quantile=0.10)
+    high_pipeline = _build_pipeline(loss="quantile", quantile=0.90)
+    try:
+        low_pipeline.fit(X, y)
+        high_pipeline.fit(X, y)
+    except Exception as e:
+        log.warning(f"  Quantile models failed: {e}")
+        low_pipeline = high_pipeline = None
 
     metrics = {"r2": r2, "rmse": rmse, "mape": mape, "n_train": len(train_df)}
-    return pipeline, metrics
+    return main_pipeline, low_pipeline, high_pipeline, metrics
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  STEP 6 — Predict                                          ║
+# ║  STEP 6 — Predict (with intervals + tiered fallback)       ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-def predict_capacity(df: pd.DataFrame, model, metrics):
-    # Compute type medians from training set for fallback
+def _safe_predict(pipeline, row_df):
+    try:
+        return float(np.expm1(pipeline.predict(row_df)[0]))
+    except Exception:
+        return None
+
+
+def predict_capacity(df: pd.DataFrame, main_model, low_model, high_model, metrics):
     train_mask = df["capacity_parsed"].notna()
-    type_medians = df[train_mask].groupby("venue_type")["capacity_parsed"].median().to_dict()
-    global_median = df.loc[train_mask, "capacity_parsed"].median()
+    prov_type_med = (
+        df[train_mask].groupby(["province_norm", "venue_type"])["capacity_parsed"]
+        .median().to_dict()
+    )
+    type_med = df[train_mask].groupby("venue_type")["capacity_parsed"].median().to_dict()
+    global_med = df.loc[train_mask, "capacity_parsed"].median()
 
-    est_caps = []
-    methods = []
-    confidences = []
+    df["log_area"] = df["Building_Area_SqFt"].apply(
+        lambda x: np.log1p(x) if pd.notna(x) and x > 0 else np.nan
+    )
 
-    feature_cols = ["log_area", "heuristic_capacity", "mt_binary", "has_unit"]
-    cat_cols = ["venue_type", COL_MAP["province"]]
+    est_mid, est_low, est_high = [], [], []
+    methods, confidences = [], []
 
     for _, row in df.iterrows():
-        # Skip venues that already have capacity
         if pd.notna(row["capacity_parsed"]):
-            est_caps.append(row["capacity_parsed"])
+            cap = row["capacity_parsed"]
+            est_mid.append(cap)
+            est_low.append(cap)
+            est_high.append(cap)
             methods.append("known")
             confidences.append("known")
             continue
 
         has_area = pd.notna(row.get("Building_Area_SqFt")) and row["Building_Area_SqFt"] > 0
+        pred_row = pd.DataFrame([{c: row.get(c) for c in NUM_FEATURES + CAT_FEATURES}])
 
-        if has_area and model is not None:
-            # Model prediction
-            pred_row = pd.DataFrame([{
-                "log_area": np.log1p(row["Building_Area_SqFt"]),
-                "heuristic_capacity": row.get("heuristic_capacity", 0) or 0,
-                "mt_binary": int(row.get("Multi_Tenant_Flag", False)),
-                "has_unit": 1 if UNIT_KEYWORDS.search(str(row.get(COL_MAP["address"], ""))) else 0,
-                "venue_type": row["venue_type"],
-                COL_MAP["province"]: row.get(COL_MAP["province"], ""),
-            }])
-            try:
-                pred_log = model.predict(pred_row[feature_cols + cat_cols])[0]
-                pred = np.expm1(pred_log)
-                pred = max(pred, 10)  # floor
-                est_caps.append(round_to_5(pred))
+        if has_area and main_model is not None:
+            mid = _safe_predict(main_model, pred_row)
+            if mid is not None:
+                mid = max(mid, 10)
+                low = _safe_predict(low_model, pred_row) if low_model is not None else None
+                high = _safe_predict(high_model, pred_row) if high_model is not None else None
+                if low is None or low > mid:
+                    low = mid * 0.65
+                if high is None or high < mid:
+                    high = mid * 1.55
+                low = max(low, 5)
+                high = max(high, low)
+
+                est_mid.append(round_to_5(mid))
+                est_low.append(round_to_5(low))
+                est_high.append(round_to_5(high))
                 methods.append("model")
-                confidences.append("medium" if row.get("Multi_Tenant_Flag", False) else "high")
-            except Exception:
-                # Fallback to heuristic
-                h = row.get("heuristic_capacity")
-                if h and h > 0:
-                    est_caps.append(round_to_5(h))
-                    methods.append("heuristic_fallback")
-                    confidences.append("medium")
-                else:
-                    med = type_medians.get(row["venue_type"], global_median)
-                    est_caps.append(round_to_5(med) if med else None)
-                    methods.append("type_median_fallback")
-                    confidences.append("low")
-        elif has_area:
-            # No model but have area — use heuristic
+                conf = "high"
+                if row.get("Multi_Tenant_Flag", False):
+                    conf = "medium"
+                confidences.append(conf)
+                continue
+
+        # Heuristic fallback (footprint exists but model unavailable / failed)
+        if has_area:
             h = row.get("heuristic_capacity")
             if h and h > 0:
-                est_caps.append(round_to_5(h))
+                est_mid.append(round_to_5(h))
+                est_low.append(round_to_5(h * 0.6))
+                est_high.append(round_to_5(h * 1.7))
                 methods.append("heuristic_fallback")
                 confidences.append("medium")
-            else:
-                est_caps.append(None)
-                methods.append("unable")
-                confidences.append("")
-        else:
-            # No area — type median fallback
-            vtype = row["venue_type"]
-            med = type_medians.get(vtype, global_median)
-            if med and med > 0:
-                est_caps.append(round_to_5(med))
-                methods.append("type_median_fallback")
-                confidences.append("low")
-            else:
-                est_caps.append(None)
-                methods.append("unable")
-                confidences.append("")
+                continue
 
-    df["Estimated_Capacity"] = est_caps
+        # Description-only fallback (no footprint, but text mentioned a number)
+        hint = row.get("desc_capacity_hint")
+        if hint and not pd.isna(hint) and hint > 0:
+            est_mid.append(round_to_5(hint))
+            est_low.append(round_to_5(hint * 0.7))
+            est_high.append(round_to_5(hint * 1.4))
+            methods.append("description_hint")
+            confidences.append("medium")
+            continue
+
+        # Per-province × type median, then type median, then global median
+        key = (row.get("province_norm", ""), row.get("venue_type", ""))
+        med = prov_type_med.get(key)
+        if med is None or pd.isna(med):
+            med = type_med.get(row.get("venue_type", ""), global_med)
+        if med and not pd.isna(med) and med > 0:
+            est_mid.append(round_to_5(med))
+            est_low.append(round_to_5(med * 0.4))
+            est_high.append(round_to_5(med * 2.5))
+            methods.append("province_type_median")
+            confidences.append("low")
+        else:
+            est_mid.append(None)
+            est_low.append(None)
+            est_high.append(None)
+            methods.append("unable")
+            confidences.append("")
+
+    df["Estimated_Capacity"] = est_mid
+    df["Estimated_Capacity_Low"] = est_low
+    df["Estimated_Capacity_High"] = est_high
     df["Estimation_Method"] = methods
     df["Confidence"] = confidences
     return df
@@ -602,13 +765,17 @@ def predict_capacity(df: pd.DataFrame, model, metrics):
 # ╚══════════════════════════════════════════════════════════════╝
 
 def save_and_report(df: pd.DataFrame, output_path: str, metrics: dict | None):
-    # Drop internal working columns from output
-    drop_cols = ["capacity_parsed", "building_levels", "log_area", "mt_binary", "has_unit"]
+    drop_cols = [
+        "capacity_parsed", "building_levels", "log_area",
+        "n_genres", "n_categories", "description_length", "log_desc_len",
+        "has_website", "has_phone", "requires_premium", "n_events",
+        "is_age_restricted", "city_tier", "desc_capacity_hint", "province_norm",
+    ]
     out = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
     out.to_csv(output_path, index=False, encoding="utf-8")
 
     print("\n" + "=" * 60)
-    print("📊 CAPACITY ESTIMATION REPORT")
+    print("CAPACITY ESTIMATION REPORT")
     print("=" * 60)
     total = len(df)
     known = (df["Estimation_Method"] == "known").sum()
@@ -617,7 +784,8 @@ def save_and_report(df: pd.DataFrame, output_path: str, metrics: dict | None):
     mt = df["Multi_Tenant_Flag"].sum()
     by_model = (df["Estimation_Method"] == "model").sum()
     by_heur = (df["Estimation_Method"] == "heuristic_fallback").sum()
-    by_median = (df["Estimation_Method"] == "type_median_fallback").sum()
+    by_desc = (df["Estimation_Method"] == "description_hint").sum()
+    by_median = (df["Estimation_Method"] == "province_type_median").sum()
     unable = (df["Estimation_Method"] == "unable").sum()
 
     print(f"  Total venues:             {total}")
@@ -632,12 +800,26 @@ def save_and_report(df: pd.DataFrame, output_path: str, metrics: dict | None):
         print(f"  Model MAPE: {metrics['mape']:.1f}%")
         print(f"  Training samples: {metrics['n_train']}")
     else:
-        print("  ⚠️ Model not trained (insufficient data). Used heuristics only.")
+        print("  [!] Model not trained (insufficient data). Used heuristics only.")
     print()
-    print(f"  Predicted via model:      {by_model}")
-    print(f"  Predicted via heuristic:  {by_heur}")
-    print(f"  Predicted via median:     {by_median}")
-    print(f"  Unable to estimate:       {unable}")
+    print(f"  Predicted via model:        {by_model}")
+    print(f"  Predicted via heuristic:    {by_heur}")
+    print(f"  Predicted via desc hint:    {by_desc}")
+    print(f"  Predicted via prov×type:    {by_median}")
+    print(f"  Unable to estimate:         {unable}")
+
+    # Per-province breakdown
+    if "province_norm" in df.columns or COL_MAP["province"] in df.columns:
+        print()
+        print("  By province (count of estimates):")
+        prov_col = "province_norm" if "province_norm" in df.columns else COL_MAP["province"]
+        # Re-derive in case it was dropped
+        prov_series = df.get(prov_col)
+        if prov_series is None:
+            prov_series = df[COL_MAP["province"]].apply(normalize_province)
+        for prov, n in prov_series.value_counts().head(15).items():
+            print(f"    {prov or '(unknown)':<30} {n}")
+
     print(f"\n  Output: {output_path}")
     print("=" * 60)
 
@@ -654,10 +836,9 @@ def main():
     parser.add_argument("--skip-footprint", action="store_true", help="Skip footprint retrieval (use cache only)")
     args = parser.parse_args()
 
-    # Step 1
     df = load_and_split(args.input)
+    df = add_features(df)
 
-    # Step 2
     if args.skip_geocode:
         log.info("Skipping geocoding (loading from cache)...")
         cache = load_json_cache(GEOCODE_CACHE)
@@ -672,7 +853,6 @@ def main():
     else:
         df = geocode_venues(df)
 
-    # Step 3
     if args.skip_footprint:
         log.info("Skipping footprint retrieval (loading from cache)...")
         cache = load_json_cache(FOOTPRINT_CACHE)
@@ -691,18 +871,14 @@ def main():
     else:
         df = retrieve_all_footprints(df)
 
-    # Step 4
     df = add_heuristic(df)
 
-    # Step 5
-    model, metrics = train_model(df)
+    main_model, low_model, high_model, metrics = train_model(df)
 
-    # Step 6
-    df = predict_capacity(df, model, metrics)
+    df = predict_capacity(df, main_model, low_model, high_model, metrics)
 
-    # Step 7
     save_and_report(df, args.output, metrics)
+
 
 if __name__ == "__main__":
     main()
-    
