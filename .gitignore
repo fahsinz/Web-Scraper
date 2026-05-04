@@ -20,3 +20,6 @@ test_spotify.py
 
 # Claude Code
 .claude/
+
+# Database
+Database/
