@@ -33,3 +33,6 @@ test_spotify.py
 
 # Selenium browser profile (large + per-machine)
 chrome_profile/
+
+# SQL_Database output folder (teammate SQL branch)
+SQL_Database/
